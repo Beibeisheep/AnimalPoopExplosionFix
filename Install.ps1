@@ -1,6 +1,6 @@
 # Animal Poop Explosion Fix 鈥?runtime installer (PZOpt-style)
 # Usage (recommended, like PZ Optimization):
-#   irm https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1 | iex
+#   powershell -ExecutionPolicy Bypass -Command "irm https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1 | iex"
 # Or from Workshop folder / this file:
 #   powershell -ExecutionPolicy Bypass -File .\Install.ps1
 # Uninstall:
