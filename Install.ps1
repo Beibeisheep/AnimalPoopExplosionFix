@@ -317,50 +317,61 @@ function Backup-File([string]$path) {
 }
 
 function Ensure-JsonAgent([string]$gameRoot, $state) {
+    # IMPORTANT: with PZOpt the first "vmArgs" in the file is often under windows.*, not root.
+    # Always parse JSON and only ensure a single -agentlib:zbNative on the ROOT vmArgs list.
     $jsonPath = Join-Path $gameRoot 'ProjectZomboid64.json'
     if (-not (Test-Path $jsonPath)) { return $state }
-    $raw = Get-Content $jsonPath -Raw -Encoding UTF8
-    if ($raw -match 'agentlib:zbNative') { Write-Ok "JSON already has $AgentArg"; return $state }
-    if ($raw -notmatch '"vmArgs"\s*:\s*\[') { return $state }
+
+    $obj = Get-Content $jsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not $obj.vmArgs) { return $state }
+
+    $changed = $false
+    $root = [System.Collections.Generic.List[string]]::new()
+    $seenRoot = $false
+    foreach ($a in @($obj.vmArgs)) {
+        $s = [string]$a
+        if ($s -like '-agentlib:zbNative*') {
+            if (-not $seenRoot) { [void]$root.Add('-agentlib:zbNative'); $seenRoot = $true }
+            else { $changed = $true }
+        } else {
+            [void]$root.Add($s)
+        }
+    }
+    if (-not $seenRoot) {
+        $root.Insert(0, '-agentlib:zbNative')
+        $changed = $true
+    }
+
+    # Strip accidental duplicates from nested windows vmArgs (launcher merges these)
+    if ($obj.windows) {
+        foreach ($prop in $obj.windows.PSObject.Properties) {
+            $winArgs = @($prop.Value.vmArgs)
+            if (-not $winArgs) { continue }
+            $clean = @($winArgs | Where-Object { $_ -notlike '-agentlib:zbNative*' })
+            if ($clean.Count -ne $winArgs.Count) {
+                $prop.Value.vmArgs = $clean
+                $changed = $true
+            }
+        }
+    }
+
+    if (-not $changed) {
+        Write-Ok "JSON already has single root $AgentArg"
+        return $state
+    }
+
     Backup-File $jsonPath
-    $insert = "`"$AgentArg`",`r`n`t`t"
-    $newRaw = [regex]::Replace($raw, '("vmArgs"\s*:\s*\[)\s*', ('$1' + "`r`n`t`t" + $insert), 1)
-    Set-Content $jsonPath $newRaw -Encoding UTF8
+    $obj.vmArgs = $root.ToArray()
+    ($obj | ConvertTo-Json -Depth 10) | Set-Content $jsonPath -Encoding UTF8
     $state.addedJsonAgent = $true
-    Write-Ok 'patched ProjectZomboid64.json'
+    Write-Ok 'patched ProjectZomboid64.json (root vmArgs only)'
     return $state
 }
 
 function Ensure-BatAgent([string]$gameRoot, $state) {
-    $batPath = Join-Path $gameRoot 'ProjectZomboid64.bat'
-    if (-not (Test-Path $batPath)) { return $state }
-    $lines = @(Get-Content $batPath -Encoding UTF8)
-    if (($lines -join "`n") -match 'agentlib:zbNative') { Write-Ok 'BAT already patched'; return $state }
-    Backup-File $batPath
-    $changed = $false
-    $out = New-Object System.Collections.Generic.List[string]
-    foreach ($line in $lines) {
-        if ($line -match '^\s*SET\s+_JAVA_OPTIONS\s*=\s*(.*)$') {
-            $cur = $Matches[1].Trim()
-            if ([string]::IsNullOrWhiteSpace($cur)) { $out.Add("SET _JAVA_OPTIONS=$AgentArg") }
-            elseif ($cur -notmatch 'agentlib:zbNative') { $out.Add("SET _JAVA_OPTIONS=$AgentArg $cur") }
-            else { $out.Add($line) }
-            $changed = $true
-        } else { $out.Add($line) }
-    }
-    if (-not $changed) {
-        $out2 = New-Object System.Collections.Generic.List[string]
-        $ins = $false
-        foreach ($line in $out) {
-            $out2.Add($line)
-            if (-not $ins -and $line -match '^\s*@?echo\s+off') { $out2.Add("SET _JAVA_OPTIONS=$AgentArg"); $ins = $true }
-        }
-        if (-not $ins) { $out2.Insert(0, "SET _JAVA_OPTIONS=$AgentArg") }
-        $out = $out2
-    }
-    $out | Set-Content $batPath -Encoding UTF8
-    $state.addedBatAgent = $true
-    Write-Ok 'patched ProjectZomboid64.bat'
+    # Do NOT patch ProjectZomboid64.bat: Steam Normal Launch uses the JSON,
+    # and _JAVA_OPTIONS can double-load the agent or break Alternate Launch + PZOpt.
+    Write-Info 'skip BAT patch (JSON root vmArgs is enough for Normal Launch)'
     return $state
 }
 
