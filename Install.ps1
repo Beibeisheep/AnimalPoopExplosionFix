@@ -1,16 +1,12 @@
-# Animal Poop Explosion Fix - runtime installer (PZOpt-style)
-# Usage (TLS1.2 + GitHub mirrors; works better in CN):
-#   powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $ok=$false; foreach($u in @('https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1','https://ghfast.top/https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1','https://ghproxy.net/https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1')){ try { iex (irm $u); $ok=$true; break } catch { Write-Host ('[APEF] download failed: '+$u) } }; if(-not $ok){ throw 'Install.ps1 download failed' }"
-# Or from Workshop folder / this file:
+# Animal Poop Explosion Fix - runtime installer
+# Keeps: game-path detection + single root -agentlib:zbNative (PZOpt-safe). One mirror fallback.
 #   powershell -ExecutionPolicy Bypass -File .\Install.ps1
-# Uninstall:
 #   powershell -ExecutionPolicy Bypass -File .\Install.ps1 -Uninstall
 
 param([switch]$Uninstall)
 
 $ErrorActionPreference = 'Stop'
 
-# GitHub requires TLS 1.2+; older Windows PowerShell defaults can fail with "underlying connection was closed"
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 } catch {
@@ -20,11 +16,8 @@ try {
 # --- filled when publishing; override with $env:APEF_REPO = "user/AnimalPoopExplosionFix" ---
 $Repo = if ($env:APEF_REPO -and $env:APEF_REPO.Trim()) { $env:APEF_REPO.Trim() } else { 'Beibeisheep/AnimalPoopExplosionFix' }
 $ReleaseBase = "https://github.com/$Repo/releases/latest/download"
-$ReleaseMirrors = @(
-    'https://ghfast.top/https://github.com',
-    'https://ghproxy.net/https://github.com',
-    'https://mirror.ghproxy.com/https://github.com'
-)
+# Single mirror only (less noisy / fewer AV false positives than a long mirror chain)
+$ReleaseMirror = 'https://ghfast.top/https://github.com'
 
 $AgentArg = '-agentlib:zbNative'
 $StateDir = Join-Path $env:USERPROFILE '.animal_catchup_fix'
@@ -207,9 +200,7 @@ function Get-ReleaseAssetUrls([string]$name) {
     $path = "/$Repo/releases/latest/download/$name"
     $urls = New-Object System.Collections.Generic.List[string]
     [void]$urls.Add("$ReleaseBase/$name")
-    foreach ($m in $ReleaseMirrors) {
-        [void]$urls.Add("$m$path")
-    }
+    [void]$urls.Add("$ReleaseMirror$path")
     if ($env:APEF_MIRROR -and $env:APEF_MIRROR.Trim()) {
         $pref = $env:APEF_MIRROR.Trim().TrimEnd('/')
         $urls.Insert(0, "$pref/https://github.com$path")

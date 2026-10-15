@@ -1,11 +1,15 @@
-﻿# Downloads latest Install.ps1 (TLS1.2 + mirrors) and runs -Uninstall
-[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+﻿# Thin wrapper: download Install.ps1 (GitHub, then one mirror) and run -Uninstall.
+# Prefer saving to a temp file (fewer Defender false positives than nested irm|iex).
+
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch {
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+}
 
 $urls = @(
     'https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1',
-    'https://ghfast.top/https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1',
-    'https://ghproxy.net/https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1',
-    'https://mirror.ghproxy.com/https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1'
+    'https://ghfast.top/https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1'
 )
 $tmp = Join-Path $env:TEMP 'APEF-Install.ps1'
 $ok = $false
@@ -22,6 +26,6 @@ foreach ($u in $urls) {
     }
 }
 if (-not $ok) {
-    throw 'Could not download Install.ps1 from GitHub or mirrors. Check network / VPN.'
+    throw 'Could not download Install.ps1. Try VPN, or allow PowerShell in Windows Security.'
 }
 & $tmp -Uninstall
