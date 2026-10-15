@@ -1,7 +1,8 @@
 # Animal Poop Explosion Fix - runtime installer
-# Keeps: game-path detection + single root -agentlib:zbNative (PZOpt-safe). One mirror fallback.
-#   powershell -ExecutionPolicy Bypass -File .\Install.ps1
-#   powershell -ExecutionPolicy Bypass -File .\Install.ps1 -Uninstall
+# Short install:   irm .../Install.ps1 | iex
+# Short uninstall: iwr .../Uninstall.ps1 -OutFile $env:TEMP\APEF-Uninstall.ps1; powershell -File $env:TEMP\APEF-Uninstall.ps1
+# Mirror install:  irm https://ghfast.top/https://github.com/.../Install.ps1 | iex
+# Internals: TLS1.2, game-path detection, one ghfast mirror for assets, root-only JSON agent (no BAT).
 
 param([switch]$Uninstall)
 
