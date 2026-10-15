@@ -1,19 +1,30 @@
-# Animal Poop Explosion Fix 鈥?runtime installer (PZOpt-style)
-# Usage (recommended, like PZ Optimization):
-#   powershell -ExecutionPolicy Bypass -Command "irm https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1 | iex"
+# Animal Poop Explosion Fix - runtime installer (PZOpt-style)
+# Usage (TLS1.2 + GitHub mirrors; works better in CN):
+#   powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $ok=$false; foreach($u in @('https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1','https://ghfast.top/https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1','https://ghproxy.net/https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1')){ try { iex (irm $u); $ok=$true; break } catch { Write-Host ('[APEF] download failed: '+$u) } }; if(-not $ok){ throw 'Install.ps1 download failed' }"
 # Or from Workshop folder / this file:
 #   powershell -ExecutionPolicy Bypass -File .\Install.ps1
 # Uninstall:
-#   irm .../Install.ps1 | iex   then with:  & { param($u) }  OR
 #   powershell -ExecutionPolicy Bypass -File .\Install.ps1 -Uninstall
 
 param([switch]$Uninstall)
 
 $ErrorActionPreference = 'Stop'
 
+# GitHub requires TLS 1.2+; older Windows PowerShell defaults can fail with "underlying connection was closed"
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch {
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+}
+
 # --- filled when publishing; override with $env:APEF_REPO = "user/AnimalPoopExplosionFix" ---
 $Repo = if ($env:APEF_REPO -and $env:APEF_REPO.Trim()) { $env:APEF_REPO.Trim() } else { 'Beibeisheep/AnimalPoopExplosionFix' }
 $ReleaseBase = "https://github.com/$Repo/releases/latest/download"
+$ReleaseMirrors = @(
+    'https://ghfast.top/https://github.com',
+    'https://ghproxy.net/https://github.com',
+    'https://mirror.ghproxy.com/https://github.com'
+)
 
 $AgentArg = '-agentlib:zbNative'
 $StateDir = Join-Path $env:USERPROFILE '.animal_catchup_fix'
@@ -192,19 +203,41 @@ function Find-GameRoot {
     return $null
 }
 
+function Get-ReleaseAssetUrls([string]$name) {
+    $path = "/$Repo/releases/latest/download/$name"
+    $urls = New-Object System.Collections.Generic.List[string]
+    [void]$urls.Add("$ReleaseBase/$name")
+    foreach ($m in $ReleaseMirrors) {
+        [void]$urls.Add("$m$path")
+    }
+    if ($env:APEF_MIRROR -and $env:APEF_MIRROR.Trim()) {
+        $pref = $env:APEF_MIRROR.Trim().TrimEnd('/')
+        $urls.Insert(0, "$pref/https://github.com$path")
+    }
+    return $urls
+}
+
 function Download-ReleaseAsset([string]$name) {
     if ($Repo -like 'OWNER/*') {
         throw "GitHub repo not configured yet (Repo=$Repo). Set `$env:APEF_REPO or republish Install.ps1."
     }
     New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
     $out = Join-Path $CacheDir $name
-    $url = "$ReleaseBase/$name"
-    Write-Info "download $url"
-    Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
-    if (-not (Test-Path $out) -or ((Get-Item $out).Length -lt 1)) {
-        throw "Download failed: $url"
+    $errors = New-Object System.Collections.Generic.List[string]
+    foreach ($url in (Get-ReleaseAssetUrls $name)) {
+        try {
+            Write-Info "download $url"
+            Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -TimeoutSec 60
+            if ((Test-Path $out) -and ((Get-Item $out).Length -gt 0)) {
+                return $out
+            }
+            [void]$errors.Add("$url (empty file)")
+        } catch {
+            [void]$errors.Add("$url ($($_.Exception.Message))")
+            Write-Warn "download failed, trying next mirror..."
+        }
     }
-    return $out
+    throw ("Download failed for $name : " + ($errors -join ' | '))
 }
 
 function Find-WorkshopZombieBuddyLibs {
