@@ -389,63 +389,93 @@ function Ensure-RuntimeFiles([string]$gameRoot, $runtime, $state) {
 }
 
 function Invoke-Uninstall {
+    # Recovery uninstall: always strip zbNative from JSON/BAT even if install_state is missing/wrong.
     Write-Host ''
-    Write-Host '=== Animal Poop Explosion Fix - Uninstall ===' -ForegroundColor White
-    if (-not (Test-Path $StatePath)) {
-        Write-Warn 'Nothing to uninstall.'
-        Remove-Marker
-        if ($Host.Name -eq 'ConsoleHost') { pause }
-        exit 0
+    Write-Host '=== Animal Poop Explosion Fix - Uninstall / Recovery ===' -ForegroundColor White
+    $state = $null
+    if (Test-Path $StatePath) {
+        try { $state = Get-Content $StatePath -Raw | ConvertFrom-Json } catch {}
     }
-    $state = Get-Content $StatePath -Raw | ConvertFrom-Json
-    $gameRoot = $state.gameRoot
-    if (-not $gameRoot -or -not (Test-Path $gameRoot)) {
-        Write-Err "Recorded game root missing: $gameRoot"
+    $gameRoot = $null
+    if ($state -and $state.gameRoot -and (Test-Path $state.gameRoot)) {
+        $gameRoot = $state.gameRoot
+    } else {
+        $gameRoot = Find-GameRoot
+    }
+    if (-not $gameRoot) {
+        Write-Err 'Could not find Project Zomboid. cd into the game folder or set APEF_GAME_ROOT.'
         if ($Host.Name -eq 'ConsoleHost') { pause }
         exit 1
     }
+    Write-Info "game root: $gameRoot"
     Wait-GameClosed $gameRoot
-    if ($state.addedJsonAgent) {
-        $jsonPath = Join-Path $gameRoot 'ProjectZomboid64.json'
-        if (Test-Path $jsonPath) {
-            $obj = Get-Content $jsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            $args = @($obj.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -notlike '-agentlib:zbNative*' })
-            $map = [ordered]@{}
-            foreach ($p in $obj.PSObject.Properties) {
-                if ($p.Name -eq 'vmArgs') { $map[$p.Name] = $args } else { $map[$p.Name] = $p.Value }
+
+    $jsonPath = Join-Path $gameRoot 'ProjectZomboid64.json'
+    if (Test-Path $jsonPath) {
+        $raw = Get-Content $jsonPath -Raw -Encoding UTF8
+        if ($raw -match 'agentlib:zbNative') {
+            $obj = $raw | ConvertFrom-Json
+            if ($obj.vmArgs) {
+                $obj.vmArgs = @($obj.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -notlike '-agentlib:zbNative*' })
+            }
+            if ($obj.windows) {
+                foreach ($prop in $obj.windows.PSObject.Properties) {
+                    if ($prop.Value.vmArgs) {
+                        $prop.Value.vmArgs = @($prop.Value.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -notlike '-agentlib:zbNative*' })
+                    }
+                }
             }
             Backup-File $jsonPath
-            ($map | ConvertTo-Json -Depth 8) | Set-Content $jsonPath -Encoding UTF8
-            Write-Ok 'reverted JSON'
+            ($obj | ConvertTo-Json -Depth 10) | Set-Content $jsonPath -Encoding UTF8
+            Write-Ok 'removed zbNative from ProjectZomboid64.json (root + windows)'
+        } else {
+            Write-Ok 'JSON has no zbNative agent'
         }
     }
-    if ($state.addedBatAgent) {
-        $batPath = Join-Path $gameRoot 'ProjectZomboid64.bat'
-        if (Test-Path $batPath) {
-            $lines = Get-Content $batPath -Encoding UTF8
-            $out = foreach ($line in $lines) {
+
+    $batPath = Join-Path $gameRoot 'ProjectZomboid64.bat'
+    if (Test-Path $batPath) {
+        $braw = Get-Content $batPath -Raw -Encoding UTF8
+        if ($braw -match 'agentlib:zbNative') {
+            Backup-File $batPath
+            $out = foreach ($line in (Get-Content $batPath -Encoding UTF8)) {
                 if ($line -match '^\s*SET\s+_JAVA_OPTIONS\s*=\s*(.*)$') {
                     $cur2 = ($Matches[1] -replace '-agentlib:zbNative\S*', '').Trim()
                     if ([string]::IsNullOrWhiteSpace($cur2)) { continue }
                     "SET _JAVA_OPTIONS=$cur2"
                 } else { $line }
             }
-            Backup-File $batPath
             $out | Set-Content $batPath -Encoding UTF8
-            Write-Ok 'reverted BAT'
+            Write-Ok 'removed zbNative from ProjectZomboid64.bat'
+        } else {
+            Write-Ok 'BAT has no zbNative agent'
         }
     }
-    if ($state.copiedZbNative) {
-        Remove-Item (Join-Path $gameRoot 'zbNative.dll') -Force -EA SilentlyContinue
-        Write-Ok 'removed zbNative.dll'
+
+    $removeRuntime = $false
+    if ($state -and ($state.copiedZbNative -or $state.copiedZombieBuddyJar)) { $removeRuntime = $true }
+    if (Test-Path $MarkerPath) { $removeRuntime = $true }
+    if ($removeRuntime) {
+        if (-not $state -or $state.copiedZbNative -or (Test-Path $MarkerPath)) {
+            Remove-Item (Join-Path $gameRoot 'zbNative.dll') -Force -EA SilentlyContinue
+            Write-Ok 'removed zbNative.dll (if present)'
+        }
+        if (-not $state -or $state.copiedZombieBuddyJar -or (Test-Path $MarkerPath)) {
+            Remove-Item (Join-Path $gameRoot 'ZombieBuddy.jar') -Force -EA SilentlyContinue
+            Write-Ok 'removed ZombieBuddy.jar (if present)'
+        }
     }
-    if ($state.copiedZombieBuddyJar) {
-        Remove-Item (Join-Path $gameRoot 'ZombieBuddy.jar') -Force -EA SilentlyContinue
-        Write-Ok 'removed runtime jar'
-    }
+
     Remove-Item $StatePath -Force -EA SilentlyContinue
     Remove-Marker
-    Write-Ok 'Done.'
+    Remove-Item (Join-Path $env:USERPROFILE 'Zomboid\Lua\AnimalPoopExplosionFix-dont-show.txt') -Force -EA SilentlyContinue
+    if (Test-Path $StateDir) { Remove-Item $StateDir -Recurse -Force -EA SilentlyContinue }
+    if (Test-Path $CacheDir) { Remove-Item $CacheDir -Recurse -Force -EA SilentlyContinue }
+
+    Write-Host ''
+    Write-Ok 'Done. Try launching the game again.'
+    Write-Warn 'If it still fails with missing mainfont_0.png, Steam → Verify integrity of game files.'
+    Write-Host ''
     if ($Host.Name -eq 'ConsoleHost') { pause }
     exit 0
 }
