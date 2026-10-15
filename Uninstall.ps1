@@ -154,41 +154,70 @@ function Wait-GameClosed([string]$gameRoot) {
     }
 }
 
+function Write-Utf8NoBom([string]$path, [string]$text) {
+    $enc = New-Object System.Text.UTF8Encoding $false
+    [IO.File]::WriteAllText($path, $text, $enc)
+}
+
+function Test-PsPrettyJson([string]$raw) {
+    return [bool]($raw -match '"mainClass":\s{2}"')
+}
+
+function Find-CompactJsonText([string]$jsonPath) {
+    $dir = (Get-Item -LiteralPath $jsonPath).DirectoryName
+    $candidates = New-Object System.Collections.Generic.List[string]
+    Get-ChildItem -LiteralPath $dir -Filter 'ProjectZomboid64.json.acfbackup_*' -File -EA SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        ForEach-Object { [void]$candidates.Add($_.FullName) }
+    $baseline = Join-Path $env:USERPROFILE '.animal_catchup_fix\baseline_ProjectZomboid64.json'
+    if (Test-Path -LiteralPath $baseline) { [void]$candidates.Add($baseline) }
+    $fallback = $null
+    foreach ($c in $candidates) {
+        try {
+            $t = [IO.File]::ReadAllText($c)
+            if (Test-PsPrettyJson $t) { continue }
+            if ($t -notmatch '"mainClass"\s*:') { continue }
+            if ($t -match 'pzopt|AOTCache') { return $t }
+            if (-not $fallback) { $fallback = $t }
+        } catch {}
+    }
+    return $fallback
+}
+
+function Remove-AgentlibEntries([string]$raw) {
+    $s = $raw
+    $s = [regex]::Replace($s, ',\s*\r?\n\s*"-agentlib:zbNative[^"]*"', '')
+    $s = [regex]::Replace($s, '"-agentlib:zbNative[^"]*"\s*,\s*\r?\n\s*', '')
+    $s = [regex]::Replace($s, '"-agentlib:zbNative[^"]*"\s*,?', '')
+    return $s
+}
+
 function Strip-JsonAgent([string]$gameRoot) {
+    # NEVER ConvertTo-Json — pretty PS JSON breaks the PZ/PZOpt launcher.
     $jsonPath = Join-Path $gameRoot 'ProjectZomboid64.json'
     if (-not (Test-Path $jsonPath)) {
         Write-Warn "missing $jsonPath"
         return $false
     }
-    $raw = Get-Content $jsonPath -Raw -Encoding UTF8
-    if ($raw -notmatch 'agentlib:zbNative') {
-        Write-Ok 'JSON has no zbNative agent'
-        return $false
-    }
-    $obj = $raw | ConvertFrom-Json
+    $raw = [IO.File]::ReadAllText($jsonPath)
     $changed = $false
-    if ($obj.vmArgs) {
-        $clean = @($obj.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -notlike '-agentlib:zbNative*' })
-        if ($clean.Count -ne @($obj.vmArgs).Count) {
-            $obj.vmArgs = $clean
-            $changed = $true
-        }
+    if (Test-PsPrettyJson $raw) {
+        Write-Warn 'JSON has ConvertTo-Json formatting (breaks launcher). Restoring compact backup...'
+        Backup-File $jsonPath
+        $restored = Find-CompactJsonText $jsonPath
+        if ($restored) { $raw = $restored; $changed = $true }
+        else { Write-Err 'Could not find compact JSON backup. Steam → Verify integrity.' }
     }
-    if ($obj.windows) {
-        foreach ($prop in $obj.windows.PSObject.Properties) {
-            $winArgs = @($prop.Value.vmArgs)
-            if (-not $winArgs) { continue }
-            $wclean = @($winArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -notlike '-agentlib:zbNative*' })
-            if ($wclean.Count -ne $winArgs.Count) {
-                $prop.Value.vmArgs = $wclean
-                $changed = $true
-            }
-        }
+    if ($raw -match 'agentlib:zbNative') {
+        $stripped = Remove-AgentlibEntries $raw
+        if ($stripped -cne $raw) { $raw = $stripped; $changed = $true }
     }
     if ($changed) {
         Backup-File $jsonPath
-        ($obj | ConvertTo-Json -Depth 10) | Set-Content $jsonPath -Encoding UTF8
-        Write-Ok 'removed -agentlib:zbNative from ProjectZomboid64.json (root + windows)'
+        Write-Utf8NoBom $jsonPath $raw
+        Write-Ok 'repaired ProjectZomboid64.json (stripped zbNative / restored compact; no ConvertTo-Json)'
+    } elseif ($raw -notmatch 'agentlib:zbNative') {
+        Write-Ok 'JSON has no zbNative agent'
     }
     return $changed
 }

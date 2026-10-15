@@ -3,6 +3,7 @@
 # Short uninstall: iwr .../Uninstall.ps1 -OutFile $env:TEMP\APEF-Uninstall.ps1; powershell -File $env:TEMP\APEF-Uninstall.ps1
 # Mirror install:  irm https://ghfast.top/https://github.com/.../Install.ps1 | iex
 # Internals: TLS1.2, game-path detection, one ghfast mirror for assets, root-only JSON agent (no BAT).
+# CRITICAL: never rewrite ProjectZomboid64.json via ConvertTo-Json — pretty PS JSON breaks the PZ/PZOpt launcher.
 
 param([switch]$Uninstall)
 
@@ -308,55 +309,117 @@ function Backup-File([string]$path) {
     Copy-Item -Force $path "$path.acfbackup_$(Get-Date -Format yyyyMMdd_HHmmss)"
 }
 
+function Write-Utf8NoBom([string]$path, [string]$text) {
+    $enc = New-Object System.Text.UTF8Encoding $false
+    [IO.File]::WriteAllText($path, $text, $enc)
+}
+
+function Test-PsPrettyJson([string]$raw) {
+    # PowerShell ConvertTo-Json writes ":  " (colon + 2 spaces). PZ/PZOpt launcher rejects that layout.
+    return [bool]($raw -match '"mainClass":\s{2}"')
+}
+
+function Find-CompactJsonText([string]$jsonPath) {
+    $dir = (Get-Item -LiteralPath $jsonPath).DirectoryName
+    $candidates = New-Object System.Collections.Generic.List[string]
+    # Prefer newest game-folder backups first (keeps current AOTCache vs AOTCacheOutput).
+    Get-ChildItem -LiteralPath $dir -Filter 'ProjectZomboid64.json.acfbackup_*' -File -EA SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        ForEach-Object { [void]$candidates.Add($_.FullName) }
+    $baseline = Join-Path $env:USERPROFILE '.animal_catchup_fix\baseline_ProjectZomboid64.json'
+    if (Test-Path -LiteralPath $baseline) { [void]$candidates.Add($baseline) }
+    $fallback = $null
+    foreach ($c in $candidates) {
+        try {
+            $t = [IO.File]::ReadAllText($c)
+            if (Test-PsPrettyJson $t) { continue }
+            if ($t -notmatch '"mainClass"\s*:') { continue }
+            if ($t -match 'pzopt|AOTCache') { return $t }
+            if (-not $fallback) { $fallback = $t }
+        } catch {}
+    }
+    return $fallback
+}
+
+function Remove-AgentlibEntries([string]$raw) {
+    $s = $raw
+    $s = [regex]::Replace($s, ',\s*\r?\n\s*"-agentlib:zbNative[^"]*"', '')
+    $s = [regex]::Replace($s, '"-agentlib:zbNative[^"]*"\s*,\s*\r?\n\s*', '')
+    $s = [regex]::Replace($s, '"-agentlib:zbNative[^"]*"\s*,?', '')
+    return $s
+}
+
+function Add-RootAgentlib([string]$raw) {
+    try {
+        $obj = $raw | ConvertFrom-Json
+        $hasRoot = @($obj.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -like '-agentlib:zbNative*' })
+        if ($hasRoot.Count -gt 0) { return $raw }
+    } catch {}
+
+    # Prefer the ROOT vmArgs that follows the windows block (PZOpt puts nested vmArgs first).
+    $pattern = '(?s)("windows"\s*:\s*\{.*?\}\s*,\s*"vmArgs"\s*:\s*\[)'
+    if ([regex]::IsMatch($raw, $pattern)) {
+        return [regex]::Replace($raw, $pattern, "`$1`r`n  `"-agentlib:zbNative`",", 1)
+    }
+    $ms = [regex]::Matches($raw, '"vmArgs"\s*:\s*\[')
+    if ($ms.Count -eq 0) { return $raw }
+    $m = $ms[$ms.Count - 1]
+    return $raw.Insert($m.Index + $m.Length, "`r`n  `"-agentlib:zbNative`",")
+}
+
 function Ensure-JsonAgent([string]$gameRoot, $state) {
-    # IMPORTANT: with PZOpt the first "vmArgs" in the file is often under windows.*, not root.
-    # Always parse JSON and only ensure a single -agentlib:zbNative on the ROOT vmArgs list.
+    # NEVER use ConvertTo-Json to rewrite ProjectZomboid64.json — pretty PS JSON breaks the PZ launcher.
+    # Text-patch only: restore compact layout if needed, strip nested agents, insert one root agent.
     $jsonPath = Join-Path $gameRoot 'ProjectZomboid64.json'
     if (-not (Test-Path $jsonPath)) { return $state }
 
-    $obj = Get-Content $jsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if (-not $obj.vmArgs) { return $state }
-
+    $raw = [IO.File]::ReadAllText($jsonPath)
     $changed = $false
-    $root = [System.Collections.Generic.List[string]]::new()
-    $seenRoot = $false
-    foreach ($a in @($obj.vmArgs)) {
-        $s = [string]$a
-        if ($s -like '-agentlib:zbNative*') {
-            if (-not $seenRoot) { [void]$root.Add('-agentlib:zbNative'); $seenRoot = $true }
-            else { $changed = $true }
-        } else {
-            [void]$root.Add($s)
+    $backedUp = $false
+
+    if (Test-PsPrettyJson $raw) {
+        Write-Warn 'ProjectZomboid64.json has PowerShell ConvertTo-Json formatting (breaks launcher). Restoring compact JSON...'
+        Backup-File $jsonPath
+        $backedUp = $true
+        $restored = Find-CompactJsonText $jsonPath
+        if (-not $restored) {
+            throw 'Cannot restore compact ProjectZomboid64.json. Steam → Verify integrity, then re-run install.'
         }
-    }
-    if (-not $seenRoot) {
-        $root.Insert(0, '-agentlib:zbNative')
+        $raw = $restored
         $changed = $true
     }
 
-    # Strip accidental duplicates from nested windows vmArgs (launcher merges these)
-    if ($obj.windows) {
-        foreach ($prop in $obj.windows.PSObject.Properties) {
-            $winArgs = @($prop.Value.vmArgs)
-            if (-not $winArgs) { continue }
-            $clean = @($winArgs | Where-Object { $_ -notlike '-agentlib:zbNative*' })
-            if ($clean.Count -ne $winArgs.Count) {
-                $prop.Value.vmArgs = $clean
-                $changed = $true
-            }
+    $stripped = Remove-AgentlibEntries $raw
+    if ($stripped -cne $raw) {
+        $raw = $stripped
+        $changed = $true
+    }
+
+    $withAgent = Add-RootAgentlib $raw
+    if ($withAgent -cne $raw) {
+        $raw = $withAgent
+        $changed = $true
+    }
+
+    try {
+        $obj = $raw | ConvertFrom-Json
+        $rootCount = @($obj.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -like '-agentlib:zbNative*' }).Count
+        if ($rootCount -ne 1) {
+            throw "root agentlib count=$rootCount (expected 1)"
         }
+    } catch {
+        throw "ProjectZomboid64.json patch failed validation: $($_.Exception.Message)"
     }
 
     if (-not $changed) {
-        Write-Ok "JSON already has single root $AgentArg"
+        Write-Ok "JSON already has single root $AgentArg (compact)"
         return $state
     }
 
-    Backup-File $jsonPath
-    $obj.vmArgs = $root.ToArray()
-    ($obj | ConvertTo-Json -Depth 10) | Set-Content $jsonPath -Encoding UTF8
+    if (-not $backedUp) { Backup-File $jsonPath }
+    Write-Utf8NoBom $jsonPath $raw
     $state.addedJsonAgent = $true
-    Write-Ok 'patched ProjectZomboid64.json (root vmArgs only)'
+    Write-Ok 'patched ProjectZomboid64.json (text patch, root vmArgs only, no ConvertTo-Json)'
     return $state
 }
 
@@ -412,24 +475,29 @@ function Invoke-Uninstall {
 
     $jsonPath = Join-Path $gameRoot 'ProjectZomboid64.json'
     if (Test-Path $jsonPath) {
-        $raw = Get-Content $jsonPath -Raw -Encoding UTF8
-        if ($raw -match 'agentlib:zbNative') {
-            $obj = $raw | ConvertFrom-Json
-            if ($obj.vmArgs) {
-                $obj.vmArgs = @($obj.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -notlike '-agentlib:zbNative*' })
-            }
-            if ($obj.windows) {
-                foreach ($prop in $obj.windows.PSObject.Properties) {
-                    if ($prop.Value.vmArgs) {
-                        $prop.Value.vmArgs = @($prop.Value.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -notlike '-agentlib:zbNative*' })
-                    }
-                }
-            }
+        $raw = [IO.File]::ReadAllText($jsonPath)
+        $changed = $false
+        $backedUp = $false
+        if (Test-PsPrettyJson $raw) {
+            Write-Warn 'JSON has ConvertTo-Json formatting (breaks launcher). Restoring compact backup...'
             Backup-File $jsonPath
-            ($obj | ConvertTo-Json -Depth 10) | Set-Content $jsonPath -Encoding UTF8
-            Write-Ok 'removed zbNative from ProjectZomboid64.json (root + windows)'
-        } else {
+            $backedUp = $true
+            $restored = Find-CompactJsonText $jsonPath
+            if ($restored) { $raw = $restored; $changed = $true }
+            else { Write-Err 'Could not find a compact JSON backup. Steam → Verify integrity.' }
+        }
+        if ($raw -match 'agentlib:zbNative') {
+            $stripped = Remove-AgentlibEntries $raw
+            if ($stripped -cne $raw) { $raw = $stripped; $changed = $true }
+        }
+        if ($changed) {
+            if (-not $backedUp) { Backup-File $jsonPath }
+            Write-Utf8NoBom $jsonPath $raw
+            Write-Ok 'repaired ProjectZomboid64.json (stripped zbNative / restored compact; no ConvertTo-Json)'
+        } elseif ($raw -notmatch 'agentlib:zbNative') {
             Write-Ok 'JSON has no zbNative agent'
+        } else {
+            Write-Ok 'JSON unchanged'
         }
     }
 
