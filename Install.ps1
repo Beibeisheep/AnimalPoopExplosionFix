@@ -1,16 +1,20 @@
-# Animal Poop Explosion Fix - runtime installer (PZOpt-style)
-# cmd / PowerShell:
+# Animal Poop Explosion Fix 鈥?runtime installer (PZOpt-style)
+# Usage (recommended, like PZ Optimization):
 #   powershell -ExecutionPolicy Bypass -Command "irm https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Install.ps1 | iex"
+# Or from Workshop folder / this file:
+#   powershell -ExecutionPolicy Bypass -File .\Install.ps1
 # Uninstall:
-#   powershell -ExecutionPolicy Bypass -Command "irm https://github.com/Beibeisheep/AnimalPoopExplosionFix/releases/latest/download/Uninstall.ps1 | iex"
-# Or: powershell -ExecutionPolicy Bypass -File .\Install.ps1 [-Uninstall]
+#   irm .../Install.ps1 | iex   then with:  & { param($u) }  OR
+#   powershell -ExecutionPolicy Bypass -File .\Install.ps1 -Uninstall
 
 param([switch]$Uninstall)
 
 $ErrorActionPreference = 'Stop'
 
+# --- filled when publishing; override with $env:APEF_REPO = "user/AnimalPoopExplosionFix" ---
 $Repo = if ($env:APEF_REPO -and $env:APEF_REPO.Trim()) { $env:APEF_REPO.Trim() } else { 'Beibeisheep/AnimalPoopExplosionFix' }
 $ReleaseBase = "https://github.com/$Repo/releases/latest/download"
+
 $AgentArg = '-agentlib:zbNative'
 $StateDir = Join-Path $env:USERPROFILE '.animal_catchup_fix'
 $StatePath = Join-Path $StateDir 'install_state.json'
@@ -25,53 +29,173 @@ function Write-Err([string]$msg) { Write-Host "[APEF] $msg" -ForegroundColor Red
 
 function Get-ScriptModRoot {
     if ($PSScriptRoot) {
-        if ((Split-Path $PSScriptRoot -Leaf) -eq '42') {
-            return (Split-Path $PSScriptRoot -Parent)
-        }
+        $parent = Split-Path $PSScriptRoot -Parent
+        # Workshop layout: .../AnimalPoopExplosionFix/42/Install.ps1
+        if ((Split-Path $PSScriptRoot -Leaf) -eq '42') { return $parent }
         return $PSScriptRoot
     }
     return $null
 }
 
+function Add-UniquePath([System.Collections.Generic.List[string]]$list, [string]$path) {
+    if (-not $path) { return }
+    $norm = $path.TrimEnd('\', '/')
+    if (-not $norm) { return }
+    foreach ($existing in $list) {
+        if ($existing.Equals($norm, [StringComparison]::OrdinalIgnoreCase)) { return }
+    }
+    [void]$list.Add($norm)
+}
+
+function Read-LibraryFoldersVdf([string]$vdf) {
+    $found = New-Object System.Collections.Generic.List[string]
+    if (-not (Test-Path -LiteralPath $vdf)) { return $found }
+    $txt = Get-Content -LiteralPath $vdf -Raw -EA SilentlyContinue
+    if (-not $txt) { return $found }
+    [regex]::Matches($txt, '"path"\s+"([^"]+)"') | ForEach-Object {
+        $lib = ($_.Groups[1].Value -replace '\\\\', '\').TrimEnd('\', '/')
+        if ($lib) { Add-UniquePath $found $lib }
+    }
+    return $found
+}
+
+function Get-SteamInstallPaths {
+    $paths = New-Object System.Collections.Generic.List[string]
+    foreach ($key in @(
+        'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam',
+        'HKLM:\SOFTWARE\Valve\Steam',
+        'HKCU:\SOFTWARE\Valve\Steam'
+    )) {
+        try {
+            $p = (Get-ItemProperty -Path $key -Name InstallPath -EA SilentlyContinue).InstallPath
+            if ($p) { Add-UniquePath $paths $p }
+        } catch {}
+    }
+    foreach ($f in @(
+        (Join-Path ${env:ProgramFiles(x86)} 'Steam'),
+        (Join-Path $env:ProgramFiles 'Steam'),
+        'D:\software\Steam',
+        'D:\Steam',
+        'C:\Steam',
+        'E:\Steam',
+        'F:\Steam'
+    )) {
+        if ($f -and (Test-Path -LiteralPath $f)) { Add-UniquePath $paths $f }
+    }
+    return $paths
+}
+
 function Get-SteamLibraryRoots {
     $roots = New-Object System.Collections.Generic.List[string]
-    foreach ($vdf in @(
-        (Join-Path ${env:ProgramFiles(x86)} 'Steam\steamapps\libraryfolders.vdf'),
-        (Join-Path $env:ProgramFiles 'Steam\steamapps\libraryfolders.vdf')
-    )) {
-        if (-not (Test-Path $vdf)) { continue }
-        $txt = Get-Content $vdf -Raw -EA SilentlyContinue
-        if (-not $txt) { continue }
-        [regex]::Matches($txt, '"path"\s+"([^"]+)"') | ForEach-Object {
-            $lib = $_.Groups[1].Value -replace '\\\\', '\'
-            if ($lib) { [void]$roots.Add($lib) }
+    foreach ($steam in Get-SteamInstallPaths) {
+        Add-UniquePath $roots $steam
+        foreach ($lib in (Read-LibraryFoldersVdf (Join-Path $steam 'steamapps\libraryfolders.vdf'))) {
+            Add-UniquePath $roots $lib
         }
     }
-    foreach ($f in @('D:\software\Steam', (Join-Path ${env:ProgramFiles(x86)} 'Steam'), (Join-Path $env:ProgramFiles 'Steam'))) {
-        if ($f -and (Test-Path $f) -and -not ($roots -contains $f)) { [void]$roots.Add($f) }
+    # Common secondary library folder names on every fixed drive (covers F:\SteamLibrary etc.)
+    foreach ($drive in ([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady })) {
+        $root = $drive.RootDirectory.FullName.TrimEnd('\')
+        foreach ($name in @('SteamLibrary', 'Steam', 'SteamGames', 'Games\Steam', 'Program Files\Steam', 'Program Files (x86)\Steam')) {
+            $candidate = Join-Path $root $name
+            if (Test-Path -LiteralPath (Join-Path $candidate 'steamapps')) {
+                Add-UniquePath $roots $candidate
+            }
+        }
     }
     return $roots
 }
 
+function Test-GameRoot([string]$dir) {
+    if (-not $dir) { return $false }
+    return (Test-Path -LiteralPath (Join-Path $dir 'ProjectZomboid64.json')) -or
+           (Test-Path -LiteralPath (Join-Path $dir 'ProjectZomboid64.exe'))
+}
+
+function Resolve-GameRootPath([string]$dir) {
+    if (-not (Test-GameRoot $dir)) { return $null }
+    $resolved = (Resolve-Path -LiteralPath $dir).Path
+    $json = Join-Path $resolved 'ProjectZomboid64.json'
+    if (-not (Test-Path -LiteralPath $json)) {
+        Write-Warn "Found game folder but ProjectZomboid64.json is missing: $resolved"
+        Write-Warn 'Run Steam → Project Zomboid → Properties → Installed Files → Verify integrity of game files.'
+        return $null
+    }
+    return $resolved
+}
+
+function Find-GameRootFromPwd {
+    # irm|iex inherits the caller's cwd — many players already cd into the game folder.
+    $probe = @(
+        (Get-Location).Path,
+        $PWD.Path,
+        $env:CD
+    ) | Where-Object { $_ } | Select-Object -Unique
+    foreach ($start in $probe) {
+        $cur = $start
+        for ($i = 0; $i -lt 6 -and $cur; $i++) {
+            $hit = Resolve-GameRootPath $cur
+            if ($hit) { return $hit }
+            $leaf = Split-Path $cur -Leaf
+            # If cwd is ...\ProjectZomboid\something, still walk up
+            $parent = Split-Path $cur -Parent
+            if (-not $parent -or $parent -eq $cur) { break }
+            $cur = $parent
+            if ($leaf -eq 'ProjectZomboid') { break }
+        }
+    }
+    return $null
+}
+
 function Find-GameRoot {
+    # 1) Explicit override
+    if ($env:APEF_GAME_ROOT -and $env:APEF_GAME_ROOT.Trim()) {
+        $hit = Resolve-GameRootPath $env:APEF_GAME_ROOT.Trim()
+        if ($hit) { return $hit }
+        Write-Warn "APEF_GAME_ROOT is set but invalid: $($env:APEF_GAME_ROOT)"
+    }
+
+    # 2) Current directory (fixes players who opened cmd inside the game folder)
+    $fromPwd = Find-GameRootFromPwd
+    if ($fromPwd) { return $fromPwd }
+
+    # 3) Steam libraries (registry + libraryfolders.vdf + per-drive SteamLibrary scan)
     $candidates = New-Object System.Collections.Generic.List[string]
     foreach ($lib in Get-SteamLibraryRoots) {
-        [void]$candidates.Add((Join-Path $lib 'steamapps\common\ProjectZomboid'))
+        Add-UniquePath $candidates (Join-Path $lib 'steamapps\common\ProjectZomboid')
     }
     foreach ($c in @(
         'D:\software\Steam\steamapps\common\ProjectZomboid',
         'C:\Program Files (x86)\Steam\steamapps\common\ProjectZomboid',
-        'C:\Program Files\Steam\steamapps\common\ProjectZomboid'
-    )) { [void]$candidates.Add($c) }
+        'C:\Program Files\Steam\steamapps\common\ProjectZomboid',
+        'D:\SteamLibrary\steamapps\common\ProjectZomboid',
+        'E:\SteamLibrary\steamapps\common\ProjectZomboid',
+        'F:\SteamLibrary\steamapps\common\ProjectZomboid',
+        'G:\SteamLibrary\steamapps\common\ProjectZomboid'
+    )) { Add-UniquePath $candidates $c }
+
     foreach ($c in $candidates) {
-        if ($c -and (Test-Path (Join-Path $c 'ProjectZomboid64.json'))) {
-            return (Resolve-Path $c).Path
+        $hit = Resolve-GameRootPath $c
+        if ($hit) { return $hit }
+    }
+
+    # 4) Interactive fallback
+    if ($Host.Name -eq 'ConsoleHost') {
+        Write-Warn 'Auto-detect failed. Paste your Project Zomboid folder path and press Enter.'
+        Write-Warn 'Example: F:\SteamLibrary\steamapps\common\ProjectZomboid'
+        $manual = Read-Host 'Game folder'
+        if ($manual) {
+            $hit = Resolve-GameRootPath $manual.Trim().Trim('"')
+            if ($hit) { return $hit }
         }
     }
     return $null
 }
 
 function Download-ReleaseAsset([string]$name) {
+    if ($Repo -like 'OWNER/*') {
+        throw "GitHub repo not configured yet (Repo=$Repo). Set `$env:APEF_REPO or republish Install.ps1."
+    }
     New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
     $out = Join-Path $CacheDir $name
     $url = "$ReleaseBase/$name"
@@ -96,6 +220,7 @@ function Find-WorkshopZombieBuddyLibs {
 }
 
 function Resolve-Runtime([string]$modRoot) {
+    # 1) GitHub Release (preferred, PZOpt-style)
     try {
         $dll = Download-ReleaseAsset 'zbNative.dll'
         $jar = Download-ReleaseAsset 'ZombieBuddy.jar'
@@ -103,8 +228,12 @@ function Resolve-Runtime([string]$modRoot) {
     } catch {
         Write-Warn "GitHub release download failed: $($_.Exception.Message)"
     }
+
+    # 2) Workshop ZombieBuddy cache
     $ws = Find-WorkshopZombieBuddyLibs
     if ($ws) { return $ws }
+
+    # 3) Bundled next to workshop mod (jar only usually)
     if ($modRoot) {
         $bJar = Join-Path $modRoot 'libs\ZombieBuddy.jar'
         $bDll = Join-Path $modRoot 'libs\zbNative.dll'
@@ -154,73 +283,51 @@ function Backup-File([string]$path) {
     Copy-Item -Force $path "$path.acfbackup_$(Get-Date -Format yyyyMMdd_HHmmss)"
 }
 
-function Write-JsonFile([string]$path, $obj) {
-    function Q([string]$s) { return '"' + ($s -replace '\\', '\\' -replace '"', '\"') + '"' }
-    $lines = New-Object System.Collections.Generic.List[string]
-    [void]$lines.Add('{')
-    [void]$lines.Add(' "mainClass": ' + (Q ([string]$obj.mainClass)) + ',')
-    [void]$lines.Add(' "classpath": [')
-    $cp = @($obj.classpath | ForEach-Object { [string]$_ })
-    for ($i = 0; $i -lt $cp.Count; $i++) {
-        $comma = $(if ($i -lt $cp.Count - 1) { ',' } else { '' })
-        [void]$lines.Add('  ' + (Q $cp[$i]) + $comma)
-    }
-    [void]$lines.Add(' ],')
-    if ($obj.windows) {
-        [void]$lines.Add(' "windows": {')
-        $wkeys = @($obj.windows.PSObject.Properties.Name)
-        for ($i = 0; $i -lt $wkeys.Count; $i++) {
-            $k = $wkeys[$i]
-            $wa = @($obj.windows.$k.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_ -notlike '-agentlib:zbNative*' })
-            $inner = ($wa | ForEach-Object { Q $_ }) -join ', '
-            $comma = $(if ($i -lt $wkeys.Count - 1) { ',' } else { '' })
-            [void]$lines.Add('  ' + (Q $k) + ': {"vmArgs": [' + $inner + ']}' + $comma)
-        }
-        [void]$lines.Add(' },')
-    }
-    [void]$lines.Add(' "vmArgs": [')
-    $va = @($obj.vmArgs | ForEach-Object { [string]$_ })
-    for ($i = 0; $i -lt $va.Count; $i++) {
-        $comma = $(if ($i -lt $va.Count - 1) { ',' } else { '' })
-        [void]$lines.Add('  ' + (Q $va[$i]) + $comma)
-    }
-    [void]$lines.Add(' ]')
-    [void]$lines.Add('}')
-    [System.IO.File]::WriteAllText($path, (($lines -join "`r`n") + "`r`n"), [System.Text.UTF8Encoding]::new($false))
-}
-
 function Ensure-JsonAgent([string]$gameRoot, $state) {
-    # Only patch ROOT vmArgs. Regex on first "vmArgs" hits windows.* first and can
-    # duplicate -agentlib when OS args are merged -> game fails to launch.
     $jsonPath = Join-Path $gameRoot 'ProjectZomboid64.json'
     if (-not (Test-Path $jsonPath)) { return $state }
-    $obj = Get-Content $jsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    $root = @($obj.vmArgs | ForEach-Object { [string]$_ })
-    $alreadyRoot = $root -contains '-agentlib:zbNative'
-    $dirtyWin = $false
-    if ($obj.windows) {
-        foreach ($p in $obj.windows.PSObject.Properties) {
-            foreach ($a in @($p.Value.vmArgs)) {
-                if ([string]$a -like '-agentlib:zbNative*') { $dirtyWin = $true }
-            }
-        }
-    }
-    if ($alreadyRoot -and -not $dirtyWin) {
-        Write-Ok "JSON root vmArgs already has $AgentArg"
-        return $state
-    }
+    $raw = Get-Content $jsonPath -Raw -Encoding UTF8
+    if ($raw -match 'agentlib:zbNative') { Write-Ok "JSON already has $AgentArg"; return $state }
+    if ($raw -notmatch '"vmArgs"\s*:\s*\[') { return $state }
     Backup-File $jsonPath
-    if (-not $alreadyRoot) {
-        $obj.vmArgs = @('-agentlib:zbNative') + $root
-        $state.addedJsonAgent = $true
+    $insert = "`"$AgentArg`",`r`n`t`t"
+    $newRaw = [regex]::Replace($raw, '("vmArgs"\s*:\s*\[)\s*', ('$1' + "`r`n`t`t" + $insert), 1)
+    Set-Content $jsonPath $newRaw -Encoding UTF8
+    $state.addedJsonAgent = $true
+    Write-Ok 'patched ProjectZomboid64.json'
+    return $state
+}
+
+function Ensure-BatAgent([string]$gameRoot, $state) {
+    $batPath = Join-Path $gameRoot 'ProjectZomboid64.bat'
+    if (-not (Test-Path $batPath)) { return $state }
+    $lines = @(Get-Content $batPath -Encoding UTF8)
+    if (($lines -join "`n") -match 'agentlib:zbNative') { Write-Ok 'BAT already patched'; return $state }
+    Backup-File $batPath
+    $changed = $false
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $lines) {
+        if ($line -match '^\s*SET\s+_JAVA_OPTIONS\s*=\s*(.*)$') {
+            $cur = $Matches[1].Trim()
+            if ([string]::IsNullOrWhiteSpace($cur)) { $out.Add("SET _JAVA_OPTIONS=$AgentArg") }
+            elseif ($cur -notmatch 'agentlib:zbNative') { $out.Add("SET _JAVA_OPTIONS=$AgentArg $cur") }
+            else { $out.Add($line) }
+            $changed = $true
+        } else { $out.Add($line) }
     }
-    if ($obj.windows) {
-        foreach ($p in $obj.windows.PSObject.Properties) {
-            $p.Value.vmArgs = @($p.Value.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_ -notlike '-agentlib:zbNative*' })
+    if (-not $changed) {
+        $out2 = New-Object System.Collections.Generic.List[string]
+        $ins = $false
+        foreach ($line in $out) {
+            $out2.Add($line)
+            if (-not $ins -and $line -match '^\s*@?echo\s+off') { $out2.Add("SET _JAVA_OPTIONS=$AgentArg"); $ins = $true }
         }
+        if (-not $ins) { $out2.Insert(0, "SET _JAVA_OPTIONS=$AgentArg") }
+        $out = $out2
     }
-    Write-JsonFile $jsonPath $obj
-    Write-Ok 'patched ProjectZomboid64.json (root vmArgs only)'
+    $out | Set-Content $batPath -Encoding UTF8
+    $state.addedBatAgent = $true
+    Write-Ok 'patched ProjectZomboid64.bat'
     return $state
 }
 
@@ -262,23 +369,36 @@ function Invoke-Uninstall {
         exit 1
     }
     Wait-GameClosed $gameRoot
-
     if ($state.addedJsonAgent) {
         $jsonPath = Join-Path $gameRoot 'ProjectZomboid64.json'
         if (Test-Path $jsonPath) {
-            Backup-File $jsonPath
             $obj = Get-Content $jsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            $obj.vmArgs = @($obj.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -notlike '-agentlib:zbNative*' })
-            if ($obj.windows) {
-                foreach ($p in $obj.windows.PSObject.Properties) {
-                    $p.Value.vmArgs = @($p.Value.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -notlike '-agentlib:zbNative*' })
-                }
+            $args = @($obj.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -notlike '-agentlib:zbNative*' })
+            $map = [ordered]@{}
+            foreach ($p in $obj.PSObject.Properties) {
+                if ($p.Name -eq 'vmArgs') { $map[$p.Name] = $args } else { $map[$p.Name] = $p.Value }
             }
-            Write-JsonFile $jsonPath $obj
+            Backup-File $jsonPath
+            ($map | ConvertTo-Json -Depth 8) | Set-Content $jsonPath -Encoding UTF8
             Write-Ok 'reverted JSON'
         }
     }
-
+    if ($state.addedBatAgent) {
+        $batPath = Join-Path $gameRoot 'ProjectZomboid64.bat'
+        if (Test-Path $batPath) {
+            $lines = Get-Content $batPath -Encoding UTF8
+            $out = foreach ($line in $lines) {
+                if ($line -match '^\s*SET\s+_JAVA_OPTIONS\s*=\s*(.*)$') {
+                    $cur2 = ($Matches[1] -replace '-agentlib:zbNative\S*', '').Trim()
+                    if ([string]::IsNullOrWhiteSpace($cur2)) { continue }
+                    "SET _JAVA_OPTIONS=$cur2"
+                } else { $line }
+            }
+            Backup-File $batPath
+            $out | Set-Content $batPath -Encoding UTF8
+            Write-Ok 'reverted BAT'
+        }
+    }
     if ($state.copiedZbNative) {
         Remove-Item (Join-Path $gameRoot 'zbNative.dll') -Force -EA SilentlyContinue
         Write-Ok 'removed zbNative.dll'
@@ -306,6 +426,9 @@ $modRoot = Get-ScriptModRoot
 $gameRoot = Find-GameRoot
 if (-not $gameRoot) {
     Write-Err 'Could not find Project Zomboid (ProjectZomboid64.json).'
+    Write-Err 'Fix: open cmd in the game folder (the one with ProjectZomboid64.exe), then re-run the install command,'
+    Write-Err 'or set:  set APEF_GAME_ROOT=F:\SteamLibrary\steamapps\common\ProjectZomboid'
+    Write-Err 'Steam → right-click Project Zomboid → Manage → Browse local files  shows the correct folder.'
     if ($Host.Name -eq 'ConsoleHost') { pause }
     exit 1
 }
@@ -318,7 +441,9 @@ $runtime = $null
 if (-not ((Test-Path $dstDll) -and (Test-Path $dstJar))) {
     $runtime = Resolve-Runtime $modRoot
     if (-not $runtime) {
-        Write-Err 'Could not get zbNative.dll / ZombieBuddy.jar from GitHub Release or Workshop ZombieBuddy.'
+        Write-Err 'Could not get zbNative.dll / ZombieBuddy.jar.'
+        Write-Err "1) Publish a GitHub Release on $Repo with those assets, or"
+        Write-Err "2) Subscribe to ZombieBuddy Workshop ($ZB_WORKSHOP_ID)."
         if ($Host.Name -eq 'ConsoleHost') { pause }
         exit 1
     }
@@ -330,13 +455,13 @@ if (-not ((Test-Path $dstDll) -and (Test-Path $dstJar))) {
 $state = Read-State
 $state.gameRoot = $gameRoot
 $state.installedAt = (Get-Date).ToString('o')
-$state.addedBatAgent = $false
 if ($runtime) { $state = Ensure-RuntimeFiles $gameRoot $runtime $state }
 $state = Ensure-JsonAgent $gameRoot $state
+$state = Ensure-BatAgent $gameRoot $state
 Save-State $state
 Write-Marker
 
 Write-Host ''
-Write-Ok 'Done. Start Project Zomboid from Steam (Normal Launch) with this mod enabled.'
+Write-Ok 'Done. Enable Animal Poop Explosion Fix and start the game.'
 Write-Host ''
 if ($Host.Name -eq 'ConsoleHost') { pause }
