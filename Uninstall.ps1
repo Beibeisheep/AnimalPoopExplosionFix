@@ -14,12 +14,25 @@ $StateDir = Join-Path $env:USERPROFILE '.animal_catchup_fix'
 $StatePath = Join-Path $StateDir 'install_state.json'
 $MarkerPath = Join-Path $env:USERPROFILE 'Zomboid\Lua\AnimalPoopExplosionFix-installed.txt'
 $CacheDir = Join-Path $env:TEMP 'AnimalPoopExplosionFix-runtime'
-$HelperFlag = Join-Path $env:USERPROFILE 'Zomboid\Lua\AnimalPoopExplosionFix-dont-show.txt'
+$HelperFlag = Join-Path $env:USERPROFILE 'Zomboid\Lua\AnimalPoopExplosionFix-hide-helper.txt'
+$LegacyHelperFlag = Join-Path $env:USERPROFILE 'Zomboid\Lua\AnimalPoopExplosionFix-dont-show.txt'
 
 function Write-Info([string]$msg) { Write-Host "[APEF] $msg" -ForegroundColor Cyan }
 function Write-Ok([string]$msg) { Write-Host "[APEF] $msg" -ForegroundColor Green }
 function Write-Warn([string]$msg) { Write-Host "[APEF] $msg" -ForegroundColor Yellow }
 function Write-Err([string]$msg) { Write-Host "[APEF] $msg" -ForegroundColor Red }
+
+function Join-SafePath([string]$base, [string]$child) {
+    if ([string]::IsNullOrWhiteSpace($base)) { return $null }
+    if ($base -match '^[A-Za-z]:$') { $base = $base + '\' }
+    if ([string]::IsNullOrWhiteSpace($child)) { return $base }
+    try { return [IO.Path]::Combine($base, $child.TrimStart('\', '/')) } catch { return $null }
+}
+
+function Test-SafePath([string]$path) {
+    if ([string]::IsNullOrWhiteSpace($path)) { return $false }
+    try { return [bool](Test-Path -LiteralPath $path -ErrorAction SilentlyContinue) } catch { return $false }
+}
 
 function Add-UniquePath([System.Collections.Generic.List[string]]$list, [string]$path) {
     if (-not $path) { return }
@@ -33,7 +46,7 @@ function Add-UniquePath([System.Collections.Generic.List[string]]$list, [string]
 
 function Read-LibraryFoldersVdf([string]$vdf) {
     $found = New-Object System.Collections.Generic.List[string]
-    if (-not (Test-Path -LiteralPath $vdf)) { return $found }
+    if (-not (Test-SafePath $vdf)) { return $found }
     $txt = Get-Content -LiteralPath $vdf -Raw -EA SilentlyContinue
     if (-not $txt) { return $found }
     [regex]::Matches($txt, '"path"\s+"([^"]+)"') | ForEach-Object {
@@ -50,17 +63,22 @@ function Get-SteamInstallPaths {
         'HKLM:\SOFTWARE\Valve\Steam',
         'HKCU:\SOFTWARE\Valve\Steam'
     )) {
-        try {
-            $p = (Get-ItemProperty -Path $key -Name InstallPath -EA SilentlyContinue).InstallPath
-            if ($p) { Add-UniquePath $paths $p }
-        } catch {}
+        foreach ($prop in @('InstallPath', 'SteamPath')) {
+            try {
+                $p = (Get-ItemProperty -Path $key -Name $prop -EA SilentlyContinue).$prop
+                if ($p) {
+                    $p = ($p -replace '/', '\')
+                    if (Test-SafePath $p) { Add-UniquePath $paths $p }
+                }
+            } catch {}
+        }
     }
     foreach ($f in @(
-        (Join-Path ${env:ProgramFiles(x86)} 'Steam'),
-        (Join-Path $env:ProgramFiles 'Steam'),
+        (Join-SafePath ${env:ProgramFiles(x86)} 'Steam'),
+        (Join-SafePath $env:ProgramFiles 'Steam'),
         'D:\software\Steam', 'D:\Steam', 'C:\Steam', 'E:\Steam', 'F:\Steam'
     )) {
-        if ($f -and (Test-Path -LiteralPath $f)) { Add-UniquePath $paths $f }
+        if (Test-SafePath $f) { Add-UniquePath $paths $f }
     }
     return $paths
 }
@@ -69,30 +87,40 @@ function Get-SteamLibraryRoots {
     $roots = New-Object System.Collections.Generic.List[string]
     foreach ($steam in Get-SteamInstallPaths) {
         Add-UniquePath $roots $steam
-        foreach ($lib in (Read-LibraryFoldersVdf (Join-Path $steam 'steamapps\libraryfolders.vdf'))) {
-            Add-UniquePath $roots $lib
+        foreach ($lib in (Read-LibraryFoldersVdf (Join-SafePath $steam 'steamapps\libraryfolders.vdf'))) {
+            if (Test-SafePath $lib) { Add-UniquePath $roots $lib }
         }
     }
-    foreach ($drive in ([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady })) {
-        $root = $drive.RootDirectory.FullName.TrimEnd('\')
+    $drives = @()
+    try {
+        $drives = [IO.DriveInfo]::GetDrives() | Where-Object {
+            try { $_.DriveType -eq 'Fixed' -and $_.IsReady } catch { $false }
+        }
+    } catch {}
+    foreach ($drive in $drives) {
+        $root = $drive.RootDirectory.FullName
         foreach ($name in @('SteamLibrary', 'Steam', 'SteamGames', 'Games\Steam', 'Program Files\Steam', 'Program Files (x86)\Steam')) {
-            $candidate = Join-Path $root $name
-            if (Test-Path -LiteralPath (Join-Path $candidate 'steamapps')) { Add-UniquePath $roots $candidate }
+            $candidate = Join-SafePath $root $name
+            if (Test-SafePath (Join-SafePath $candidate 'steamapps')) { Add-UniquePath $roots $candidate }
         }
     }
     return $roots
 }
 
 function Test-GameRoot([string]$dir) {
-    if (-not $dir) { return $false }
-    return (Test-Path -LiteralPath (Join-Path $dir 'ProjectZomboid64.json')) -or
-           (Test-Path -LiteralPath (Join-Path $dir 'ProjectZomboid64.exe'))
+    if (-not (Test-SafePath $dir)) { return $false }
+    return (Test-SafePath (Join-SafePath $dir 'ProjectZomboid64.json')) -or
+           (Test-SafePath (Join-SafePath $dir 'ProjectZomboid64.exe'))
 }
 
 function Resolve-GameRootPath([string]$dir) {
     if (-not (Test-GameRoot $dir)) { return $null }
-    $resolved = (Resolve-Path -LiteralPath $dir).Path
-    if (-not (Test-Path -LiteralPath (Join-Path $resolved 'ProjectZomboid64.json'))) { return $null }
+    try {
+        $resolved = (Resolve-Path -LiteralPath $dir -ErrorAction Stop).Path
+    } catch {
+        return $null
+    }
+    if (-not (Test-SafePath (Join-SafePath $resolved 'ProjectZomboid64.json'))) { return $null }
     return $resolved
 }
 
@@ -114,7 +142,7 @@ function Find-GameRoot {
     }
     $candidates = New-Object System.Collections.Generic.List[string]
     foreach ($lib in Get-SteamLibraryRoots) {
-        Add-UniquePath $candidates (Join-Path $lib 'steamapps\common\ProjectZomboid')
+        Add-UniquePath $candidates (Join-SafePath $lib 'steamapps\common\ProjectZomboid')
     }
     foreach ($c in @(
         'D:\software\Steam\steamapps\common\ProjectZomboid',
@@ -284,7 +312,7 @@ if (Test-Path $StatePath) {
 }
 
 $gameRoot = $null
-if ($state -and $state.gameRoot -and (Test-Path $state.gameRoot)) {
+if ($state -and $state.gameRoot -and (Test-SafePath $state.gameRoot)) {
     $gameRoot = $state.gameRoot
     Write-Info "game root (from install record): $gameRoot"
 } else {
@@ -310,6 +338,7 @@ Remove-RuntimeIfOurs $gameRoot $state
 Remove-Item $StatePath -Force -EA SilentlyContinue
 Remove-Item $MarkerPath -Force -EA SilentlyContinue
 Remove-Item $HelperFlag -Force -EA SilentlyContinue
+Remove-Item $LegacyHelperFlag -Force -EA SilentlyContinue
 if (Test-Path $StateDir) { Remove-Item $StateDir -Recurse -Force -EA SilentlyContinue }
 if (Test-Path $CacheDir) { Remove-Item $CacheDir -Recurse -Force -EA SilentlyContinue }
 Write-Ok 'cleared install markers / state / temp cache'

@@ -1,4 +1,4 @@
-# Animal Poop Explosion Fix - runtime installer
+﻿# Animal Poop Explosion Fix - runtime installer
 # Short install:   irm .../Install.ps1 | iex
 # Short uninstall: iwr .../Uninstall.ps1 -OutFile $env:TEMP\APEF-Uninstall.ps1; powershell -File $env:TEMP\APEF-Uninstall.ps1
 # Mirror install:  irm https://ghfast.top/https://github.com/.../Install.ps1 | iex
@@ -43,6 +43,18 @@ function Get-ScriptModRoot {
     return $null
 }
 
+function Join-SafePath([string]$base, [string]$child) {
+    if ([string]::IsNullOrWhiteSpace($base)) { return $null }
+    if ($base -match '^[A-Za-z]:$') { $base = $base + '\' }
+    if ([string]::IsNullOrWhiteSpace($child)) { return $base }
+    try { return [IO.Path]::Combine($base, $child.TrimStart('\', '/')) } catch { return $null }
+}
+
+function Test-SafePath([string]$path) {
+    if ([string]::IsNullOrWhiteSpace($path)) { return $false }
+    try { return [bool](Test-Path -LiteralPath $path -ErrorAction SilentlyContinue) } catch { return $false }
+}
+
 function Add-UniquePath([System.Collections.Generic.List[string]]$list, [string]$path) {
     if (-not $path) { return }
     $norm = $path.TrimEnd('\', '/')
@@ -55,7 +67,7 @@ function Add-UniquePath([System.Collections.Generic.List[string]]$list, [string]
 
 function Read-LibraryFoldersVdf([string]$vdf) {
     $found = New-Object System.Collections.Generic.List[string]
-    if (-not (Test-Path -LiteralPath $vdf)) { return $found }
+    if (-not (Test-SafePath $vdf)) { return $found }
     $txt = Get-Content -LiteralPath $vdf -Raw -EA SilentlyContinue
     if (-not $txt) { return $found }
     [regex]::Matches($txt, '"path"\s+"([^"]+)"') | ForEach-Object {
@@ -72,21 +84,26 @@ function Get-SteamInstallPaths {
         'HKLM:\SOFTWARE\Valve\Steam',
         'HKCU:\SOFTWARE\Valve\Steam'
     )) {
-        try {
-            $p = (Get-ItemProperty -Path $key -Name InstallPath -EA SilentlyContinue).InstallPath
-            if ($p) { Add-UniquePath $paths $p }
-        } catch {}
+        foreach ($prop in @('InstallPath', 'SteamPath')) {
+            try {
+                $p = (Get-ItemProperty -Path $key -Name $prop -EA SilentlyContinue).$prop
+                if ($p) {
+                    $p = ($p -replace '/', '\')
+                    if (Test-SafePath $p) { Add-UniquePath $paths $p }
+                }
+            } catch {}
+        }
     }
     foreach ($f in @(
-        (Join-Path ${env:ProgramFiles(x86)} 'Steam'),
-        (Join-Path $env:ProgramFiles 'Steam'),
+        (Join-SafePath ${env:ProgramFiles(x86)} 'Steam'),
+        (Join-SafePath $env:ProgramFiles 'Steam'),
         'D:\software\Steam',
         'D:\Steam',
         'C:\Steam',
         'E:\Steam',
         'F:\Steam'
     )) {
-        if ($f -and (Test-Path -LiteralPath $f)) { Add-UniquePath $paths $f }
+        if (Test-SafePath $f) { Add-UniquePath $paths $f }
     }
     return $paths
 }
@@ -95,16 +112,22 @@ function Get-SteamLibraryRoots {
     $roots = New-Object System.Collections.Generic.List[string]
     foreach ($steam in Get-SteamInstallPaths) {
         Add-UniquePath $roots $steam
-        foreach ($lib in (Read-LibraryFoldersVdf (Join-Path $steam 'steamapps\libraryfolders.vdf'))) {
-            Add-UniquePath $roots $lib
+        foreach ($lib in (Read-LibraryFoldersVdf (Join-SafePath $steam 'steamapps\libraryfolders.vdf'))) {
+            if (Test-SafePath $lib) { Add-UniquePath $roots $lib }
         }
     }
-    # Common secondary library folder names on every fixed drive (covers F:\SteamLibrary etc.)
-    foreach ($drive in ([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady })) {
-        $root = $drive.RootDirectory.FullName.TrimEnd('\')
+    # Common secondary library folder names on every ready fixed drive (covers F:\SteamLibrary etc.)
+    $drives = @()
+    try {
+        $drives = [IO.DriveInfo]::GetDrives() | Where-Object {
+            try { $_.DriveType -eq 'Fixed' -and $_.IsReady } catch { $false }
+        }
+    } catch {}
+    foreach ($drive in $drives) {
+        $root = $drive.RootDirectory.FullName
         foreach ($name in @('SteamLibrary', 'Steam', 'SteamGames', 'Games\Steam', 'Program Files\Steam', 'Program Files (x86)\Steam')) {
-            $candidate = Join-Path $root $name
-            if (Test-Path -LiteralPath (Join-Path $candidate 'steamapps')) {
+            $candidate = Join-SafePath $root $name
+            if (Test-SafePath (Join-SafePath $candidate 'steamapps')) {
                 Add-UniquePath $roots $candidate
             }
         }
@@ -113,16 +136,20 @@ function Get-SteamLibraryRoots {
 }
 
 function Test-GameRoot([string]$dir) {
-    if (-not $dir) { return $false }
-    return (Test-Path -LiteralPath (Join-Path $dir 'ProjectZomboid64.json')) -or
-           (Test-Path -LiteralPath (Join-Path $dir 'ProjectZomboid64.exe'))
+    if (-not (Test-SafePath $dir)) { return $false }
+    return (Test-SafePath (Join-SafePath $dir 'ProjectZomboid64.json')) -or
+           (Test-SafePath (Join-SafePath $dir 'ProjectZomboid64.exe'))
 }
 
 function Resolve-GameRootPath([string]$dir) {
     if (-not (Test-GameRoot $dir)) { return $null }
-    $resolved = (Resolve-Path -LiteralPath $dir).Path
-    $json = Join-Path $resolved 'ProjectZomboid64.json'
-    if (-not (Test-Path -LiteralPath $json)) {
+    try {
+        $resolved = (Resolve-Path -LiteralPath $dir -ErrorAction Stop).Path
+    } catch {
+        return $null
+    }
+    $json = Join-SafePath $resolved 'ProjectZomboid64.json'
+    if (-not (Test-SafePath $json)) {
         Write-Warn "Found game folder but ProjectZomboid64.json is missing: $resolved"
         Write-Warn 'Run Steam → Project Zomboid → Properties → Installed Files → Verify integrity of game files.'
         return $null
@@ -168,7 +195,7 @@ function Find-GameRoot {
     # 3) Steam libraries (registry + libraryfolders.vdf + per-drive SteamLibrary scan)
     $candidates = New-Object System.Collections.Generic.List[string]
     foreach ($lib in Get-SteamLibraryRoots) {
-        Add-UniquePath $candidates (Join-Path $lib 'steamapps\common\ProjectZomboid')
+        Add-UniquePath $candidates (Join-SafePath $lib 'steamapps\common\ProjectZomboid')
     }
     foreach ($c in @(
         'D:\software\Steam\steamapps\common\ProjectZomboid',
@@ -235,10 +262,10 @@ function Download-ReleaseAsset([string]$name) {
 
 function Find-WorkshopZombieBuddyLibs {
     foreach ($lib in Get-SteamLibraryRoots) {
-        $ws = Join-Path $lib "steamapps\workshop\content\108600\$ZB_WORKSHOP_ID\mods\ZombieBuddy\libs"
-        $jar = Join-Path $ws 'ZombieBuddy.jar'
-        $dll = Join-Path $ws 'zbNative.dll'
-        if ((Test-Path $jar) -and (Test-Path $dll)) {
+        $ws = Join-SafePath $lib "steamapps\workshop\content\108600\$ZB_WORKSHOP_ID\mods\ZombieBuddy\libs"
+        $jar = Join-SafePath $ws 'ZombieBuddy.jar'
+        $dll = Join-SafePath $ws 'zbNative.dll'
+        if ((Test-SafePath $jar) -and (Test-SafePath $dll)) {
             return @{ Jar = $jar; Dll = $dll; Source = 'workshop-ZombieBuddy' }
         }
     }
@@ -349,6 +376,77 @@ function Remove-AgentlibEntries([string]$raw) {
     return $s
 }
 
+function Get-RootVmArgsOpenBracketIndex([string]$raw) {
+    # Brace-depth scan: root object keys sit at depth==1.
+    # Works for vanilla (root vmArgs before windows), PZOpt (root after windows),
+    # and other reorderings / odd whitespace / tabs.
+    $depth = 0
+    $inStr = $false
+    $esc = $false
+    $len = $raw.Length
+    for ($i = 0; $i -lt $len; $i++) {
+        $c = $raw[$i]
+        if ($inStr) {
+            if ($esc) { $esc = $false }
+            elseif ($c -eq '\') { $esc = $true }
+            elseif ($c -eq '"') { $inStr = $false }
+            continue
+        }
+        if ($c -eq '"') {
+            if ($depth -eq 1 -and ($i + 8) -le $len -and $raw.Substring($i, 8) -eq '"vmArgs"') {
+                $j = $i + 8
+                while ($j -lt $len -and [char]::IsWhiteSpace($raw[$j])) { $j++ }
+                if ($j -lt $len -and $raw[$j] -eq ':') {
+                    $j++
+                    while ($j -lt $len -and [char]::IsWhiteSpace($raw[$j])) { $j++ }
+                    if ($j -lt $len -and $raw[$j] -eq '[') { return $j }
+                }
+            }
+            $inStr = $true
+            continue
+        }
+        if ($c -eq '{') { $depth++ }
+        elseif ($c -eq '}') { $depth-- }
+    }
+    return -1
+}
+
+function Get-RootObjectCloseBraceIndex([string]$raw) {
+    $depth = 0
+    $inStr = $false
+    $esc = $false
+    $len = $raw.Length
+    $lastRootClose = -1
+    for ($i = 0; $i -lt $len; $i++) {
+        $c = $raw[$i]
+        if ($inStr) {
+            if ($esc) { $esc = $false }
+            elseif ($c -eq '\') { $esc = $true }
+            elseif ($c -eq '"') { $inStr = $false }
+            continue
+        }
+        if ($c -eq '"') { $inStr = $true; continue }
+        if ($c -eq '{') { $depth++ }
+        elseif ($c -eq '}') {
+            if ($depth -eq 1) { $lastRootClose = $i }
+            $depth--
+        }
+    }
+    return $lastRootClose
+}
+
+function Add-MissingRootVmArgsProperty([string]$raw) {
+    $close = Get-RootObjectCloseBraceIndex $raw
+    if ($close -lt 0) { return $raw }
+    $before = $raw.Substring(0, $close).TrimEnd()
+    if ($before.EndsWith(',')) {
+        $insert = "`r`n`t`"vmArgs`": [`r`n`t`t`"-agentlib:zbNative`"`r`n`t]`r`n"
+    } else {
+        $insert = ",`r`n`t`"vmArgs`": [`r`n`t`t`"-agentlib:zbNative`"`r`n`t]`r`n"
+    }
+    return $before + $insert + $raw.Substring($close)
+}
+
 function Add-RootAgentlib([string]$raw) {
     try {
         $obj = $raw | ConvertFrom-Json
@@ -356,15 +454,20 @@ function Add-RootAgentlib([string]$raw) {
         if ($hasRoot.Count -gt 0) { return $raw }
     } catch {}
 
-    # Prefer the ROOT vmArgs that follows the windows block (PZOpt puts nested vmArgs first).
-    $pattern = '(?s)("windows"\s*:\s*\{.*?\}\s*,\s*"vmArgs"\s*:\s*\[)'
-    if ([regex]::IsMatch($raw, $pattern)) {
-        return [regex]::Replace($raw, $pattern, "`$1`r`n  `"-agentlib:zbNative`",", 1)
+    $bracket = Get-RootVmArgsOpenBracketIndex $raw
+    if ($bracket -ge 0) {
+        $tail = $raw.Substring($bracket + 1)
+        $indent = '  '
+        if ($tail -match '(?m)^[\t ]*\r?\n([\t ]+)"') { $indent = $Matches[1] }
+        elseif ($raw.Contains("`t")) { $indent = "`t`t" }
+        $nl = if ($raw.Contains("`r`n")) { "`r`n" } else { "`n" }
+        $entry = $nl + $indent + '"-agentlib:zbNative",'
+        return $raw.Insert($bracket + 1, $entry)
     }
-    $ms = [regex]::Matches($raw, '"vmArgs"\s*:\s*\[')
-    if ($ms.Count -eq 0) { return $raw }
-    $m = $ms[$ms.Count - 1]
-    return $raw.Insert($m.Index + $m.Length, "`r`n  `"-agentlib:zbNative`",")
+
+    # No root vmArgs key at all (rare / heavily customized) — create one on the root object.
+    Write-Warn 'ProjectZomboid64.json has no root vmArgs; creating root vmArgs with -agentlib:zbNative'
+    return Add-MissingRootVmArgsProperty $raw
 }
 
 function Ensure-JsonAgent([string]$gameRoot, $state) {
@@ -404,8 +507,14 @@ function Ensure-JsonAgent([string]$gameRoot, $state) {
     try {
         $obj = $raw | ConvertFrom-Json
         $rootCount = @($obj.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -like '-agentlib:zbNative*' }).Count
-        if ($rootCount -ne 1) {
-            throw "root agentlib count=$rootCount (expected 1)"
+        $nestedCount = 0
+        if ($obj.windows) {
+            foreach ($p in $obj.windows.PSObject.Properties) {
+                $nestedCount += @($p.Value.vmArgs | ForEach-Object { [string]$_ } | Where-Object { $_ -like '-agentlib:zbNative*' }).Count
+            }
+        }
+        if ($rootCount -ne 1 -or $nestedCount -ne 0) {
+            throw "root agentlib count=$rootCount (expected 1), nested=$nestedCount (expected 0)"
         }
     } catch {
         throw "ProjectZomboid64.json patch failed validation: $($_.Exception.Message)"
@@ -460,7 +569,7 @@ function Invoke-Uninstall {
         try { $state = Get-Content $StatePath -Raw | ConvertFrom-Json } catch {}
     }
     $gameRoot = $null
-    if ($state -and $state.gameRoot -and (Test-Path $state.gameRoot)) {
+    if ($state -and $state.gameRoot -and (Test-SafePath $state.gameRoot)) {
         $gameRoot = $state.gameRoot
     } else {
         $gameRoot = Find-GameRoot
@@ -520,22 +629,31 @@ function Invoke-Uninstall {
         }
     }
 
-    $removeRuntime = $false
-    if ($state -and ($state.copiedZbNative -or $state.copiedZombieBuddyJar)) { $removeRuntime = $true }
-    if (Test-Path $MarkerPath) { $removeRuntime = $true }
-    if ($removeRuntime) {
-        if (-not $state -or $state.copiedZbNative -or (Test-Path $MarkerPath)) {
-            Remove-Item (Join-Path $gameRoot 'zbNative.dll') -Force -EA SilentlyContinue
-            Write-Ok 'removed zbNative.dll (if present)'
-        }
-        if (-not $state -or $state.copiedZombieBuddyJar -or (Test-Path $MarkerPath)) {
-            Remove-Item (Join-Path $gameRoot 'ZombieBuddy.jar') -Force -EA SilentlyContinue
-            Write-Ok 'removed ZombieBuddy.jar (if present)'
-        }
+    $removeDll = $false
+    $removeJar = $false
+    if ($state) {
+        if ($state.copiedZbNative) { $removeDll = $true }
+        if ($state.copiedZombieBuddyJar) { $removeJar = $true }
+    } elseif (Test-SafePath $MarkerPath) {
+        $removeDll = $true
+        $removeJar = $true
+    }
+    if ($env:APEF_FORCE_REMOVE_RUNTIME -eq '1') {
+        $removeDll = $true
+        $removeJar = $true
+    }
+    if ($removeDll) {
+        Remove-Item -LiteralPath (Join-SafePath $gameRoot 'zbNative.dll') -Force -EA SilentlyContinue
+        Write-Ok 'removed zbNative.dll (if present)'
+    }
+    if ($removeJar) {
+        Remove-Item -LiteralPath (Join-SafePath $gameRoot 'ZombieBuddy.jar') -Force -EA SilentlyContinue
+        Write-Ok 'removed ZombieBuddy.jar (if present)'
     }
 
     Remove-Item $StatePath -Force -EA SilentlyContinue
     Remove-Marker
+    Remove-Item (Join-Path $env:USERPROFILE 'Zomboid\Lua\AnimalPoopExplosionFix-hide-helper.txt') -Force -EA SilentlyContinue
     Remove-Item (Join-Path $env:USERPROFILE 'Zomboid\Lua\AnimalPoopExplosionFix-dont-show.txt') -Force -EA SilentlyContinue
     if (Test-Path $StateDir) { Remove-Item $StateDir -Recurse -Force -EA SilentlyContinue }
     if (Test-Path $CacheDir) { Remove-Item $CacheDir -Recurse -Force -EA SilentlyContinue }
